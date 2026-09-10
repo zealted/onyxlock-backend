@@ -80,7 +80,155 @@ async function sendLicenseEmail(email, licenseKey, planName) {
   });
 }
 
+// ─── X (Twitter) Linked-Account Setup ──────────────────────────────────────────
+db.exec(`
+  CREATE TABLE IF NOT EXISTS x_users (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    x_id          TEXT UNIQUE NOT NULL,
+    x_handle      TEXT NOT NULL,
+    x_name        TEXT,
+    app_username  TEXT UNIQUE NOT NULL,
+    created_at    TEXT DEFAULT (datetime('now')),
+    last_login_at TEXT
+  )
+`);
+
+// In-memory PKCE/state store — fine for a single Render instance.
+// Entries are short-lived (cleared after use or after 10 minutes).
+const oauthStates = new Map();
+function cleanupOauthStates() {
+  const now = Date.now();
+  for (const [k, v] of oauthStates) {
+    if (now - v.createdAt > 10 * 60 * 1000) oauthStates.delete(k);
+  }
+}
+
+function base64url(buf) {
+  return buf.toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+
+function generateAppUsername(xHandle) {
+  const base = 'onyx_' + xHandle.toLowerCase().replace(/[^a-z0-9]/g, '').slice(0, 15);
+  const exists = (name) => db.prepare('SELECT 1 FROM x_users WHERE app_username = ?').get(name);
+  let candidate = base;
+  let attempt = 0;
+  while (exists(candidate)) {
+    attempt++;
+    candidate = `${base}${crypto.randomInt(100, 999)}`;
+    if (attempt > 20) { candidate = `${base}${Date.now()}`; break; }
+  }
+  return candidate;
+}
+
+// Small HTML page shown inside the OAuth popup once linking finishes.
+// It writes the result into document.title; the desktop app's popup window
+// watches for that title change and reads the result from it — no extra
+// redirect back into the app is needed.
+function renderResultPage(success, record, errorMsg) {
+  const payload = success
+    ? { success: true, x_id: record.x_id, x_handle: record.x_handle, app_username: record.app_username }
+    : { success: false, error: errorMsg || 'Login failed' };
+  const encoded = Buffer.from(JSON.stringify(payload)).toString('base64');
+
+  return `<!DOCTYPE html><html><head><meta charset="utf-8"></head>
+  <body style="background:#0E1014;color:#DCDCDC;font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;">
+    <div style="text-align:center;">
+      <p style="font-size:1.1rem;">${success ? `Connected as <strong style="color:#F0B90B;">@${record.x_handle}</strong>` : (errorMsg || 'Login failed')}</p>
+      <p style="color:#646E7D;font-size:0.85rem;">You can close this window.</p>
+    </div>
+    <script>document.title = "ONYX_AUTH_RESULT:${encoded}";</script>
+  </body></html>`;
+}
+
 // ─── Routes ───────────────────────────────────────────────────────────────────
+
+// X login — the desktop app opens this URL in a popup window
+app.get('/api/auth/x/login', (req, res) => {
+  cleanupOauthStates();
+
+  if (!process.env.X_CLIENT_ID || !process.env.X_CALLBACK_URL) {
+    return res.status(500).send('X login is not configured on the server yet.');
+  }
+
+  const state = crypto.randomBytes(16).toString('hex');
+  const codeVerifier = base64url(crypto.randomBytes(48));
+  const codeChallenge = base64url(crypto.createHash('sha256').update(codeVerifier).digest());
+
+  oauthStates.set(state, { codeVerifier, createdAt: Date.now() });
+
+  const params = new URLSearchParams({
+    response_type: 'code',
+    client_id: process.env.X_CLIENT_ID,
+    redirect_uri: process.env.X_CALLBACK_URL,
+    scope: 'users.read tweet.read',
+    state,
+    code_challenge: codeChallenge,
+    code_challenge_method: 'S256',
+  });
+
+  res.redirect(`https://twitter.com/i/oauth2/authorize?${params.toString()}`);
+});
+
+// X redirects back here after the user approves
+app.get('/api/auth/x/callback', async (req, res) => {
+  const { code, state, error } = req.query;
+
+  if (error) return res.send(renderResultPage(false, null, 'Login was cancelled.'));
+
+  const stored = oauthStates.get(state);
+  if (!stored) return res.send(renderResultPage(false, null, 'This login link expired — please try again.'));
+  oauthStates.delete(state);
+
+  try {
+    const basicAuth = Buffer.from(`${process.env.X_CLIENT_ID}:${process.env.X_CLIENT_SECRET}`).toString('base64');
+    const tokenRes = await axios.post(
+      'https://api.twitter.com/2/oauth2/token',
+      new URLSearchParams({
+        grant_type: 'authorization_code',
+        code,
+        redirect_uri: process.env.X_CALLBACK_URL,
+        code_verifier: stored.codeVerifier,
+      }).toString(),
+      { headers: { Authorization: `Basic ${basicAuth}`, 'Content-Type': 'application/x-www-form-urlencoded' } }
+    );
+
+    const accessToken = tokenRes.data.access_token;
+
+    const meRes = await axios.get('https://api.twitter.com/2/users/me', {
+      headers: { Authorization: `Bearer ${accessToken}` },
+    });
+    const xUser = meRes.data.data; // { id, name, username }
+
+    let record = db.prepare('SELECT * FROM x_users WHERE x_id = ?').get(xUser.id);
+    if (!record) {
+      const appUsername = generateAppUsername(xUser.username);
+      db.prepare(
+        `INSERT INTO x_users (x_id, x_handle, x_name, app_username, last_login_at) VALUES (?, ?, ?, ?, datetime('now'))`
+      ).run(xUser.id, xUser.username, xUser.name, appUsername);
+      record = db.prepare('SELECT * FROM x_users WHERE x_id = ?').get(xUser.id);
+    } else {
+      db.prepare(`UPDATE x_users SET last_login_at = datetime('now'), x_handle = ?, x_name = ? WHERE x_id = ?`)
+        .run(xUser.username, xUser.name, xUser.id);
+    }
+
+    console.log(`X linked: @${xUser.username} -> ${record.app_username}`);
+    res.send(renderResultPage(true, record));
+  } catch (err) {
+    console.error('X OAuth error:', err.response?.data || err.message);
+    res.send(renderResultPage(false, null, 'Something went wrong linking your X account.'));
+  }
+});
+
+// Admin: list every linked user (protect with ADMIN_KEY header)
+app.get('/api/admin/x-users', (req, res) => {
+  if (req.headers['x-admin-key'] !== process.env.ADMIN_KEY) return res.sendStatus(401);
+  const users = db.prepare(
+    'SELECT id, x_id, x_handle, x_name, app_username, created_at, last_login_at FROM x_users ORDER BY created_at DESC'
+  ).all();
+  res.json({ count: users.length, users });
+});
+
+
 
 // 1. Create payment — website calls this when user clicks "Get Plan"
 //    Frontend must collect email first (show a small modal before redirecting)
